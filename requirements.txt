@@ -1,0 +1,5 @@
+arcgis>=2.4.0
+numpy<2
+Pillow
+tensorflow-macos
+tensorflow-metal
