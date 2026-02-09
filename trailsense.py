@@ -19,8 +19,8 @@ CLIENT_ID = "CpOBbpWXL80dumtM"
 LAYER_TITLE = "TrailSense Conditions"
 EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".heic"}
 
-BACKBONE = "efficientnetv2"          # must match training: "efficientnetv2" or "mobilenetv2"
-APPLY_EXIF_TRANSPOSE = False         # keep False if training used tf.image.decode_image (common)
+BACKBONE = "efficientnetv2"          
+APPLY_EXIF_TRANSPOSE = False        
 
 TRAIN_HEADS = ["incision", "muddiness", "roots", "braiding"]
 HEAD_TO_FIELD = {"incision":"erosion","muddiness":"mud","roots":"roots","braiding":"braiding"}
