@@ -1,210 +1,225 @@
+import os, re, time
+os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
-import os
 from pathlib import Path
-from datetime import datetime, timezone
-
+from datetime import datetime
 import numpy as np
-from PIL import Image
-from PIL.ExifTags import TAGS, GPSTAGS
+from PIL import Image, ExifTags
 from arcgis.gis import GIS
-from arcgis.features import FeatureLayer, Feature
+from arcgis.features import FeatureLayerCollection, Feature
 from arcgis.geometry import Point
 
-# ── Configuration ────────────────────────────────────────────────────────────
+# --- config ---
+BASE = Path(__file__).parent if "__file__" in globals() else Path.cwd()
+MODEL_PATH = BASE / "model" / "model.tflite"
+IMAGES_DIR  = BASE / "images"
 
-MODEL_PATH = Path(__file__).parent / "model" / "model.tflite"
-IMAGES_DIR = Path(__file__).parent / "images"
-
-LABELS = ["erosion", "mud", "roots", "braiding"]
-CONFIDENCE_THRESHOLD = 0.5
-INPUT_SIZE = (224, 224)
-
-# ArcGIS
 PORTAL = "https://aoslcps.maps.arcgis.com"
 CLIENT_ID = "CpOBbpWXL80dumtM"
-FEATURE_LAYER_URL = "https://services4.arcgis.com/9moZ1UwKSaAK9hCA/arcgis/rest/services/test/FeatureServer/0"
+LAYER_TITLE = "TrailSense Conditions"
+EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".heic"}
 
-SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".heic"}
+BACKBONE = "efficientnetv2"          # must match training: "efficientnetv2" or "mobilenetv2"
+APPLY_EXIF_TRANSPOSE = False         # keep False if training used tf.image.decode_image (common)
 
+TRAIN_HEADS = ["incision", "muddiness", "roots", "braiding"]
+HEAD_TO_FIELD = {"incision":"erosion","muddiness":"mud","roots":"roots","braiding":"braiding"}
+FIELDS = ["erosion","mud","roots","braiding"]
 
-# ── GPS Extraction ───────────────────────────────────────────────────────────
+GPS_TAG = next(k for k, v in ExifTags.TAGS.items() if v == "GPSInfo")
 
-def _dms_to_decimal(dms, ref):
-    degrees = float(dms[0])
-    minutes = float(dms[1])
-    seconds = float(dms[2])
-    decimal = degrees + minutes / 60.0 + seconds / 3600.0
-    if ref in ("S", "W"):
-        decimal = -decimal
-    return round(decimal, 7)
+# --- gps (minimal) ---
+def _rat(x):
+    try: return float(x)
+    except Exception:
+        try: return float(x[0]) / float(x[1])
+        except Exception: return None
 
+def _dms(dms, ref):
+    d,m,s = _rat(dms[0]), _rat(dms[1]), _rat(dms[2])
+    if None in (d,m,s): return None
+    v = d + m/60.0 + s/3600.0
+    return round(-v if ref in ("S","W") else v, 7)
 
-def extract_gps(image_path):
-    """Pull lat/lon from EXIF. Returns (lat, lon) or (None, None)."""
+def gps(p: Path):
     try:
-        img = Image.open(image_path)
-        exif_data = img._getexif()
-        if exif_data is None:
-            return None, None
-
-        gps_info = {}
-        for tag_id, value in exif_data.items():
-            tag = TAGS.get(tag_id, tag_id)
-            if tag == "GPSInfo":
-                for gps_tag_id, gps_value in value.items():
-                    gps_tag = GPSTAGS.get(gps_tag_id, gps_tag_id)
-                    gps_info[gps_tag] = gps_value
-
-        if not gps_info:
-            return None, None
-
-        lat = _dms_to_decimal(gps_info["GPSLatitude"], gps_info["GPSLatitudeRef"])
-        lon = _dms_to_decimal(gps_info["GPSLongitude"], gps_info["GPSLongitudeRef"])
-        return lat, lon
+        ex = Image.open(p)._getexif() or {}
+        g = ex.get(GPS_TAG)
+        if not g: return None, None
+        return _dms(g[2], g[1]), _dms(g[4], g[3])  # lat, lon
     except Exception:
         return None, None
 
+# --- arcgis: get or create ---
+def get_layer(gis: GIS):
+    me = gis.users.me.username
+    items = gis.content.search(
+        query=f'title:"{LAYER_TITLE}" AND owner:{me}',
+        item_type="Feature Layer",
+        max_items=5,
+    )
+    if items:
+        print("Layer found:", items[0].title)
+        return items[0].layers[0]
 
-def extract_timestamp(image_path):
-    """Pull date taken from EXIF, fallback to file mod time."""
-    try:
-        img = Image.open(image_path)
-        exif_data = img._getexif()
-        if exif_data:
-            for tag_id, value in exif_data.items():
-                tag = TAGS.get(tag_id, tag_id)
-                if tag == "DateTimeOriginal":
-                    return datetime.strptime(value, "%Y:%m:%d %H:%M:%S").replace(tzinfo=timezone.utc)
-    except Exception:
-        pass
-    mtime = os.path.getmtime(image_path)
-    return datetime.fromtimestamp(mtime, tz=timezone.utc)
+    print("Layer not found — creating…")
+    svc = re.sub(r"[^A-Za-z0-9_]+", "_", LAYER_TITLE).strip("_")[:40]
+    svc = f"{svc}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
 
+    item = gis.content.create_service(
+        name=svc,
+        service_type="featureService",
+        create_params={"name": svc, "capabilities": "Query,Create,Update,Delete,Editing"},
+    )
+    item.update(item_properties={"title": LAYER_TITLE})
 
-# ── Model ────────────────────────────────────────────────────────────────────
-
-class TrailClassifier:
-    def __init__(self, model_path=MODEL_PATH):
-        import tensorflow as tf
-        self.interpreter = tf.lite.Interpreter(model_path=str(model_path))
-        self.interpreter.allocate_tensors()
-        self.input_details = self.interpreter.get_input_details()
-        self.output_details = self.interpreter.get_output_details()
-        shape = self.input_details[0]["shape"]
-        self.input_size = (shape[1], shape[2])
-        print(f"Model loaded: {self.input_size}")
-
-    def classify(self, image_path):
-        img = Image.open(image_path).convert("RGB")
-        img = img.resize(self.input_size, Image.BILINEAR)
-        arr = np.array(img, dtype=np.float32) / 255.0
-        arr = np.expand_dims(arr, axis=0)
-
-        self.interpreter.set_tensor(self.input_details[0]["index"], arr)
-        self.interpreter.invoke()
-        output = self.interpreter.get_tensor(self.output_details[0]["index"])[0]
-
-        # sigmoid if needed
-        if output.max() > 1.0 or output.min() < 0.0:
-            output = 1.0 / (1.0 + np.exp(-output))
-        print(f"Output shape: {output.shape}, Output: {output}")
-
-        scores = {label: round(float(output[i]), 4) for i, label in enumerate(LABELS)}
-        flagged = [l for l, s in scores.items() if s >= CONFIDENCE_THRESHOLD]
-        return scores, flagged
-
-
-# ── ArcGIS ───────────────────────────────────────────────────────────────────
-
-def connect_arcgis():
-    """Authenticate via OAuth and return (gis, layer)."""
-    print("Connecting to ArcGIS...")
-    print("A browser window will open for sign-in.")
-    gis = GIS(PORTAL, client_id=CLIENT_ID)
-    print(f"Connected as: {gis.users.me.username}")
-    layer = FeatureLayer(FEATURE_LAYER_URL)
-    return gis, layer
-
-
-def upload_result(layer, result):
-    """Push a single result to ArcGIS."""
-    if result["lat"] is None:
-        print(f"  Skipping {result['file']} — no GPS")
-        return
-
-    point = Point({
-        "x": result["lon"],
-        "y": result["lat"],
-        "spatialReference": {"wkid": 4326},
+    flc = FeatureLayerCollection.fromitem(item)
+    flc.manager.add_to_definition({
+        "layers": [{
+            "id": 0,
+            "name": "observations",
+            "type": "Feature Layer",
+            "geometryType": "esriGeometryPoint",
+            "objectIdField": "OBJECTID",
+            "fields": [
+                {"name":"OBJECTID","alias":"OBJECTID","type":"esriFieldTypeOID"},
+                {"name":"image_file","alias":"image_file","type":"esriFieldTypeString","length":255},
+                {"name":"photo_date","alias":"photo_date","type":"esriFieldTypeDate"},
+                *[{"name":f,"alias":f,"type":"esriFieldTypeDouble"} for f in FIELDS],
+            ],
+        }]
     })
 
-    attributes = {
-        "image_file": result["file"],
-        "photo_date": int(result["timestamp"].timestamp() * 1000),
-        "latitude": result["lat"],
-        "longitude": result["lon"],
-        "erosion": result["scores"]["erosion"],
-        "mud": result["scores"]["mud"],
-        "roots": result["scores"]["roots"],
-        "braiding": result["scores"]["braiding"],
-        "flagged": ", ".join(result["flagged"]) if result["flagged"] else "none",
-    }
+    # re-fetch until layers are visible (avoids needing _refresh())
+    for _ in range(10):
+        item2 = gis.content.get(item.id)
+        try:
+            lyr = item2.layers[0]
+            print("Created layer:", item2.title)
+            return lyr
+        except Exception:
+            time.sleep(1)
 
-    feature = Feature(geometry=point, attributes=attributes)
-    res = layer.edit_features(adds=[feature])
-    
-    if res["addResults"][0]["success"]:
-        print(f"  ✓ Uploaded {result['file']}")
-    else:
-        print(f"  ✗ Failed {result['file']}: {res['addResults'][0]}")
+    raise RuntimeError("Created service but layer not available yet (retry).")
 
+# --- model: correct TF preprocessing + output mapping ---
+class M:
+    def __init__(self, model_path: Path):
+        import tensorflow as tf
+        self.tf = tf
+        self.t = tf.lite.Interpreter(model_path=str(model_path))
+        self.t.allocate_tensors()
+        self.inp = self.t.get_input_details()[0]
+        self.out = self.t.get_output_details()
+        _, h, w, _ = self.inp["shape"]
+        self.h, self.w = int(h), int(w)
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+        if BACKBONE == "efficientnetv2":
+            self.prep = tf.keras.applications.efficientnet_v2.preprocess_input
+        elif BACKBONE == "mobilenetv2":
+            self.prep = tf.keras.applications.mobilenet_v2.preprocess_input
+        else:
+            raise ValueError("BACKBONE must be 'efficientnetv2' or 'mobilenetv2'")
 
-def main():
-    print("\n=== TrailSense ===\n")
-
-    # Connect to ArcGIS
-    gis, layer = connect_arcgis()
-
-    # Load model
-    print("\nLoading model...")
-    classifier = TrailClassifier()
-
-    # Find images
-    images = [p for p in IMAGES_DIR.iterdir() if p.suffix.lower() in SUPPORTED_EXTENSIONS]
-    print(f"\nFound {len(images)} images in {IMAGES_DIR}\n")
-
-    # Process each image
-    for img_path in sorted(images):
-        print(f"Processing: {img_path.name}")
-        
-        lat, lon = extract_gps(img_path)
-        timestamp = extract_timestamp(img_path)
-        scores, flagged = classifier.classify(img_path)
-
-        result = {
-            "file": img_path.name,
-            "lat": lat,
-            "lon": lon,
-            "timestamp": timestamp,
-            "scores": scores,
-            "flagged": flagged,
+        print("Model input:", self.inp["shape"], "dtype:", self.inp["dtype"])
+        print("Outputs:")
+        for i, od in enumerate(self.out):
+            print(f"  [{i}] name={od.get('name')} shape={od.get('shape')} dtype={od.get('dtype')}")
+        self.map = None if len(self.out) == 1 else {
+            i: next((h for h in TRAIN_HEADS if h in (od.get("name") or "").lower()), None)
+            for i, od in enumerate(self.out)
         }
+        print("Output mapping used:", self.map, "\n")
 
-        # Print result
-        gps_str = f"({lat}, {lon})" if lat else "no GPS"
-        flag_str = ", ".join(flagged) if flagged else "none"
-        print(f"  GPS: {gps_str}")
-        print(f"  Scores: {scores}")
-        print(f"  Flagged: {flag_str}")
+    def _x(self, p: Path):
+        tf = self.tf
+        b = tf.io.read_file(str(p))
+        img = tf.image.decode_image(b, channels=3, expand_animations=False)  # uint8
+        img = tf.image.resize(img, (self.h, self.w))
+        img = tf.cast(img, tf.float32)
 
-        # Upload
-        upload_result(layer, result)
-        print()
+        if APPLY_EXIF_TRANSPOSE:
+            import PIL.ImageOps as IOP
+            arr = img.numpy().astype(np.uint8)
+            img = tf.convert_to_tensor(np.asarray(IOP.exif_transpose(Image.fromarray(arr, "RGB")), np.float32))
 
-    print("Done.")
+        if self.inp["dtype"] == np.uint8:
+            x = tf.cast(tf.clip_by_value(img, 0.0, 255.0), tf.uint8)[None, ...].numpy()
+        else:
+            x = self.prep(img)[None, ...].numpy()
 
+        print(f"    input stats: min={float(x.min()):.3f} max={float(x.max()):.3f} mean={float(x.mean()):.3f}")
+        return x
+
+    def pred(self, p: Path):
+        x = self._x(p)
+        t0 = time.perf_counter()
+        self.t.set_tensor(self.inp["index"], x)
+        self.t.invoke()
+        ms = (time.perf_counter() - t0) * 1000.0
+
+        if len(self.out) == 1:
+            y = np.asarray(self.t.get_tensor(self.out[0]["index"])).reshape(-1)
+            return {TRAIN_HEADS[i]: float(y[i]) for i in range(min(4, y.shape[0]))}, ms
+
+        scores = {}
+        for i, od in enumerate(self.out):
+            v = float(np.asarray(self.t.get_tensor(od["index"])).reshape(-1)[0])
+            h = self.map.get(i) if self.map else None
+            scores[h or (TRAIN_HEADS[i] if i < 4 else f"out{i}")] = v
+        return scores, ms
+
+# --- upload ---
+def upload(layer, p: Path, lat, lon, field_scores: dict):
+    geom = Point({"x": lon, "y": lat, "spatialReference": {"wkid": 4326}})
+    attrs = {"image_file": p.name, "photo_date": int(os.path.getmtime(p) * 1000), **field_scores}
+    r = layer.edit_features(adds=[Feature(geometry=geom, attributes=attrs)])
+    return bool(r.get("addResults") and r["addResults"][0].get("success"))
+
+# --- main ---
+def main():
+    gis = GIS(PORTAL, client_id=CLIENT_ID)
+    print("Connected as:", gis.users.me.username)
+    layer = get_layer(gis)
+    m = M(MODEL_PATH)
+
+    imgs = sorted([p for p in IMAGES_DIR.rglob("*") if p.suffix.lower() in EXTS])
+    print(f"Found {len(imgs)} images in {IMAGES_DIR}\n")
+
+    up = sk = er = 0
+    for p in imgs:
+        print("Processing:", p.name)
+        lat, lon = gps(p)
+        if lat is None or lon is None:
+            print("    GPS: none (skip)\n")
+            sk += 1
+            continue
+        print(f"    GPS: ({lat}, {lon})")
+
+        try:
+            head_scores, ms = m.pred(p)
+            field_scores = {HEAD_TO_FIELD[h]: float(v) for h, v in head_scores.items() if h in HEAD_TO_FIELD}
+
+            # fallback if name mapping incomplete
+            if len(field_scores) < 4:
+                for h in TRAIN_HEADS:
+                    if h in head_scores and HEAD_TO_FIELD[h] not in field_scores:
+                        field_scores[HEAD_TO_FIELD[h]] = float(head_scores[h])
+
+            print("    scores(fields):", {k: round(v, 4) for k, v in field_scores.items()})
+            print("    sorted(fields):", ", ".join(
+                f"{k}={v:.4f}" for k, v in sorted(field_scores.items(), key=lambda kv: kv[1], reverse=True)
+            ))
+            print(f"    infer: {ms:.1f} ms")
+
+            ok = upload(layer, p, lat, lon, field_scores)
+            print("    upload:", "OK\n" if ok else "FAIL\n")
+            up += int(ok)
+        except Exception as e:
+            er += 1
+            print("    ERROR:", repr(e), "\n")
+
+    print(f"Done. uploaded={up} skipped_no_gps={sk} errors={er}")
 
 if __name__ == "__main__":
     main()
